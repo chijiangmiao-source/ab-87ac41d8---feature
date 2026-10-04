@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>航电隔离令牌维护脚本 · 离线穷尽复核台</title>
+<style>
+  :root {
+    --bg: #0e1420; --panel: #161e2e; --panel2: #1c2638; --line: #2a3650;
+    --txt: #dbe4f3; --dim: #8ea0bd; --accent: #5aa9ff;
+    --ok: #37c978; --warn: #ffb020; --bad: #ff5d6c; --violet: #b58cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    background: var(--bg); color: var(--txt); }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--dim); font-size: 12.5px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 60px; }
+  .grid { display: grid; grid-template-columns: minmax(330px, 5fr) minmax(360px, 6fr); gap: 18px; }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--accent); letter-spacing: .5px; }
+  label { display: block; font-size: 12.5px; color: var(--dim); margin: 10px 0 4px; }
+  textarea, input { width: 100%; background: var(--panel2); color: var(--txt);
+    border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; }
+  textarea { min-height: 330px; resize: vertical; font-family: ui-monospace,Menlo,Consolas,monospace;
+    font-size: 13px; tab-size: 4; white-space: pre; }
+  .token-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .token-row input { width: 92px; }
+  .toolbar { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; align-items: center; }
+  button { border: 1px solid var(--line); background: var(--panel2); color: var(--txt);
+    border-radius: 7px; padding: 9px 18px; font: inherit; cursor: pointer; }
+  button.primary { background: #1d5bb8; border-color: #2f6fd1; color: #fff; }
+  button.primary:hover { background: #2469cc; }
+  button:hover { border-color: var(--accent); }
+  .counter { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .counter.over { color: var(--bad); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .hint code, code { background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 4px; padding: 0 5px; font-family: ui-monospace,Menlo,Consolas,monospace; }
+  .verdict { border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; border: 1px solid; }
+  .verdict.safe { border-color: var(--ok); background: rgba(55,201,120,.09); }
+  .verdict.unsafe { border-color: var(--bad); background: rgba(255,93,108,.09); }
+  .verdict.fatal { border-color: var(--warn); background: rgba(255,176,32,.09); }
+  .verdict .big { font-size: 15px; font-weight: 700; }
+  .verdict.safe .big { color: var(--ok); }
+  .verdict.unsafe .big { color: var(--bad); }
+  .verdict.fatal .big { color: var(--warn); }
+  .evflag { display: inline-block; margin-left: 10px; font-size: 12px; color: var(--warn);
+    border: 1px solid var(--warn); border-radius: 99px; padding: 0 9px; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; color: var(--dim); font-size: 13px; }
+  .stats b { color: var(--txt); font-size: 16px; display: block; }
+  h3 { font-size: 13px; margin: 18px 0 8px; color: var(--txt); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 6px 8px; vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; }
+  .steps { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .step { display: grid; grid-template-columns: 30px 86px 1fr; gap: 8px; padding: 7px 10px;
+    border-bottom: 1px solid var(--line); align-items: baseline; font-size: 12.5px; }
+  .step:last-child { border-bottom: none; }
+  .step:nth-child(odd) { background: rgba(255,255,255,.018); }
+  .step .n { color: var(--dim); text-align: right; }
+  .step .k { font-family: ui-monospace,monospace; font-size: 11.5px; color: var(--violet); }
+  .step.bad .k { color: var(--bad); }
+  .step.struct .k { color: var(--accent); }
+  .step.exit .k { color: var(--warn); }
+  .chips { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: 6px; }
+  .chip { border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font-size: 11px;
+    font-family: ui-monospace,monospace; background: var(--panel2); }
+  .chip.gained { color: var(--ok); border-color: rgba(55,201,120,.5); }
+  .chip.lost { color: var(--bad); border-color: rgba(255,93,108,.5); text-decoration: line-through; }
+  .muted { color: var(--dim); }
+  .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .errbox { font-family: ui-monospace,monospace; font-size: 12.5px; color: var(--warn);
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 10px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>航电隔离令牌维护脚本 · 离线穷尽复核台</h1>
+  <span class="sub">每个条件按 TRUE/FALSE 两结果展开 · 循环按有限次数展开 · 追踪持有令牌与待执行清理续体 · return/abort 离开前完成清理</span>
+</header>
+<main>
+  <div class="grid">
+    <section class="panel">
+      <h2>草稿（令牌 1–8 个，结构化指令至多 96 条）</h2>
+      <label>隔离令牌清单</label>
+      <div class="token-row" id="tokenRow"></div>
+      <label for="script">结构化指令</label>
+      <textarea id="script" spellcheck="false" placeholder="acquire A
+if condition_a
+  operate A
+else
+  cleanup
+    release A
+  endcleanup
+endif
+return"></textarea>
+      <div class="toolbar">
+        <button class="primary" id="btnVerify">提交复核</button>
+        <button id="btnClear">清空草稿与结论</button>
+        <span class="counter" id="counter">0 / 96 条指令</span>
+      </div>
+      <div class="hint">
+        指令：<code>acquire</code> <code>operate</code> <code>release</code> T ·
+        <code>if [名]</code>/<code>else</code>/<code>endif</code> ·
+        <code>loop K</code>/<code>endloop</code> · <code>return</code> · <code>abort</code> ·
+        <code>cleanup</code>/<code>endcleanup</code>（嵌套清理，离开时 LIFO 展开）。# 起始为注释。
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>复核结论</h2>
+      <div id="result"><div class="empty">尚未复核：提交后此处展示穷尽结果、逐步路径、令牌变化与清理展开。</div></div>
+    </section>
+  </div>
+</main>
+
+<script>
+'use strict';
+const TOKEN_COUNT = 8;
+const MAX_INSTR = 96;
+const tokenRow = document.getElementById('tokenRow');
+const scriptEl = document.getElementById('script');
+const counterEl = document.getElementById('counter');
+const resultEl = document.getElementById('result');
+
+for (let i = 0; i < TOKEN_COUNT; i++) {
+  const inp = document.createElement('input');
+  inp.maxLength = 12;
+  inp.placeholder = '令牌' + (i + 1);
+  inp.dataset.idx = i;
+  tokenRow.appendChild(inp);
+}
+function getTokens() {
+  const out = [];
+  tokenRow.querySelectorAll('input').forEach((el) => {
+    const v = el.value.trim();
+    if (v) out.push(v);
+  });
+  return out;
+}
+
+function countInstructions(text) {
+  return text.split(/\r?\n/).filter((l) => {
+    const t = l.trim();
+    return t && !t.startsWith('#');
+  }).length;
+}
+function refreshCounter() {
+  const n = countInstructions(scriptEl.value);
+  counterEl.textContent = n + ' / ' + MAX_INSTR + ' 条指令';
+  counterEl.classList.toggle('over', n > MAX_INSTR);
+}
+scriptEl.addEventListener('input', refreshCounter);
+
+document.getElementById('btnVerify').addEventListener('click', submitVerify);
+document.getElementById('btnClear').addEventListener('click', clearAll);
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function chips(before, after) {
+  before = before || []; after = after || [];
+  const b = new Set(before), a = new Set(after);
+  const all = [];
+  before.forEach((t) => { if (!all.includes(t)) all.push(t); });
+  after.forEach((t) => { if (!all.includes(t)) all.push(t); });
+  return '<span class="chips">' + all.map((t) => {
+    const had = b.has(t), has = a.has(t);
+    if (had && has) return '<span class="chip">' + esc(t) + '</span>';
+    if (!had && has) return '<span class="chip gained">+' + esc(t) + '</span>';
+    return '<span class="chip lost">−' + esc(t) + '</span>';
+  }).join('') + '</span>';
+}
+
+async function submitVerify() {
+  const tokens = getTokens();
+  const payload = { script: scriptEl.value, tokens };
+  resultEl.innerHTML = '<div class="empty">正在穷尽展开全部控制路径…</div>';
+  let r;
+  try {
+    const resp = await fetch('/api/verify', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    r = await resp.json();
+  } catch (e) {
+    resultEl.innerHTML = '<div class="verdict fatal"><div class="big">复核服务不可用</div>' +
+      '<div class="muted">' + esc(e.message) + '</div></div>';
+    return;
+  }
+  render(r);
+}
+
+async function clearAll() {
+  scriptEl.value = '';
+  tokenRow.querySelectorAll('input').forEach((el) => { el.value = ''; el.disabled = false; });
+  refreshCounter();
+  resultEl.innerHTML = '<div class="empty">草稿与结论已清空，旧证据已移除。</div>';
+  try { await fetch('/api/clear', { method: 'POST' }); } catch {}
+}
+
+function render(r) {
+  if (r.fatal) {
+    resultEl.innerHTML =
+      '<div class="verdict fatal"><span class="big">拒绝复核：输入非法</span>' +
+      '<span class="evflag">旧证据已移除</span>' +
+      '<div class="errbox">' + esc(r.error.type + (r.error.line != null ? '（第 ' + r.error.line + ' 行）' : '')) +
+      '：' + esc(r.error.message) + '</div>' +
+      '<div class="muted" style="margin-top:8px">未知令牌、循环上界越限、非法跳出清理作用域等错误都会使任何既有结论失效。</div></div>';
+    return;
+  }
+  if (!r.ok) {
+    resultEl.innerHTML = renderUnsafe(r);
+    return;
+  }
+  resultEl.innerHTML = renderSafe(r);
+}
+
+function renderUnsafe(r) {
+  const v = r.violation;
+  const ce = r.counterexample;
+  const steps = ce.steps.map((s, i) => {
+    const cls = ['condition','loop-choice','loop-repeat'].includes(s.kind) ? 'struct'
+      : ['exit'].includes(s.kind) ? 'exit'
+      : (s.ok === false || s.kind === 'exit') ? 'bad' : '';
+    let held = '';
+    if (s.heldAfter) held = chips(s.heldBefore, s.heldAfter);
+    const label = ({
+      acquire:'ACQUIRE', operate:'OPERATE', release:'RELEASE',
+      return:'RETURN', abort:'ABORT', condition:'条件分叉',
+      'loop-choice':'循环次数', 'loop-repeat':'循环折返',
+      'cleanup-register':'登记清理', 'cleanup-run':'展开清理', exit:'形成出口'
+    })[s.kind] || s.kind;
+    return '<div class="step ' + cls + '"><span class="n">' + (i + 1) + '</span>' +
+      '<span class="k">' + label + (s.line ? ' ·L' + s.line : '') + '</span>' +
+      '<span>' + esc(s.detail || '') + held + '</span></div>';
+  }).join('');
+  return '<div class="verdict unsafe"><span class="big">发现违规 — 存在不安全控制路径</span>' +
+    '<span class="evflag">旧安全证据已移除</span>' +
+    '<div class="muted" style="margin-top:6px">' + esc(v.detail) +
+    '（违规类型 <code>' + esc(v.type) + '</code>' +
+    (v.line != null ? '，第 ' + v.line + ' 行' : '') + '）</div>' +
+    '<div class="muted">最短违规路径指令步数：<b style="color:var(--bad)">' +
+    ce.instructionSteps + '</b>（同步数按源序展开，下表为完整逐步路径）</div></div>' +
+    '<div class="stats"><span>规范状态数（已停止于首个违规）<b>' + r.stats.canonicalStates + '</b></span>' +
+    '<span>指令数<b>' + r.stats.instructions + '</b></span><span>令牌<b>' + r.stats.tokens + '</b></span></div>' +
+    '<h3>完整逐步路径 · 令牌变化 · 清理展开</h3><div class="steps">' + steps + '</div>';
+}
+
+function renderSafe(r) {
+  const exits = r.exits.map((e) => {
+    const chains = (e.cleanupChains || []).map((chain, ci) => {
+      if (!chain.length) return '<div class="muted">该路径无待执行清理续体。</div>';
+      return '<details open><summary>清理展开 #' + (ci + 1) + '（' + chain.length + ' 层，LIFO 由内向外）</summary>' +
+        '<table><tr><th>展开序</th><th>深度</th><th>登记行</th><th>登记时持有</th><th>出口</th></tr>' +
+        chain.slice().reverse().map((f, j) =>
+          '<tr><td>' + (j + 1) + '</td><td>' + f.depth + '</td><td>L' + f.line +
+          '</td><td>' + (f.registeredHeld.length ? f.registeredHeld.map(esc).join(', ') : '<span class="muted">∅</span>') +
+          '</td><td><span style="color:var(--ok)">完成后继续</span></td></tr>').join('') +
+        '</table></details>';
+    }).join('');
+    const held = (e.heldAfterVariants || []).map((h) =>
+      h.length ? h.map(esc).join(', ') : '∅（已清空）').join(' | ');
+    return '<tr><td><b>' + esc(e.kind) + '</b>' + (e.line != null ? '<div class="muted">第 ' + e.line + ' 行</div>'
+      : '<div class="muted">自然结束</div>') + '</td>' +
+      '<td style="color:var(--ok)">全部路径清理完成，无遗留令牌</td>' +
+      '<td>' + held + '</td><td>' + chains + '</td></tr>';
+  }).join('');
+  return '<div class="verdict safe"><span class="big">安全 — 已穷尽全部控制路径，未发现违规</span></div>' +
+    '<div class="stats">' +
+    '<span>已穷尽规范状态数<b>' + r.stats.canonicalStates + '</b></span>' +
+    '<span>出口数<b>' + r.stats.exits + '</b></span>' +
+    '<span>指令数<b>' + r.stats.instructions + '</b></span>' +
+    '<span>令牌<b>' + r.stats.tokens + '</b></span></div>' +
+    '<h3>各出口清理结果（return / abort / 自然结束）</h3>' +
+    '<table><tr><th>出口</th><th>清理结论</th><th>清理后持有</th><th>清理续体展开</th></tr>' +
+    (exits || '<tr><td colspan="4" class="muted">脚本无任何可达出口</td></tr>') + '</table>';
+}
+</script>
+</body>
+</html>
