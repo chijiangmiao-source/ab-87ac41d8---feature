@@ -189,13 +189,18 @@ function cloneRanges(rs) {
 function cloneFrames(fs) {
   return fs.map((f) => ({ ...f, registeredHeld: f.registeredHeld.slice() }));
 }
-function stateKey(s) {
+function stateKey(s, track) {
   return s.ranges.map((r, i) =>
-    `${r.kind[0]}${r.s}-${r.e}${r.rem != null ? 'x' + r.rem : ''}${i === s.ranges.length - 1 ? '@' + s.pc : ''}`
+    `${r.kind[0]}${r.s}-${r.e}${r.rem != null ? 'x' + r.rem : ''}` +
+    // 账本模式：循环帧并入所选总次数，使不同轮次在账本中分别标明（普通复核不受影响）
+    `${track && r.kind === 'iter' && r.total != null ? 'y' + r.total : ''}` +
+    `${i === s.ranges.length - 1 ? '@' + s.pc : ''}`
   ).join('/') +
     '||' + heldArray(s.held).join(',') +
     '||' + s.frames.map((f) => `${f.pc}#${f.depth}:${f.registeredHeld.join('.')}`).join('>') +
-    '||' + (s.pendingExit || '-');
+    '||' + (s.pendingExit || '-') +
+    // 账本模式：把「目标令牌是否曾获取」纳入规范状态，使出口可区分 未曾持有 / 已释放
+    (track ? (s.touched ? '||T1' : '||T0') : '');
 }
 
 function fatal(type, message, line) {
@@ -224,6 +229,18 @@ function verify(scriptText, options = {}) {
     return fatal('bad-token-count', `令牌数量须为 ${MIN_TOKENS}..${MAX_TOKENS} 个，实得 ${tokenNames.length} 个`);
   }
 
+  // 生命周期账本：指定令牌必须在当前令牌表中，否则明确拒绝（不生成任何账本）
+  const trackToken = options.ledgerToken != null ? String(options.ledgerToken).trim() : null;
+  if (trackToken != null) {
+    if (!trackToken) {
+      return fatal('missing-ledger-token', '未指定要生成生命周期账本的令牌');
+    }
+    if (!seenName.has(trackToken)) {
+      return fatal('unknown-token',
+        `账本令牌「${trackToken}」不在当前令牌表（当前令牌表: ${tokenNames.join(', ') || '∅'}）`);
+    }
+  }
+
   let I;
   try {
     I = parse(scriptText, { names: tokenNames, maxLoop: options.maxLoop });
@@ -242,8 +259,59 @@ function verify(scriptText, options = {}) {
     exitLine: null,
     pc: 0,
     parent: null,
-    lastStep: null
+    lastStep: null,
+    touched: false // 账本模式：目标令牌在本路径上是否已获取过
   };
+
+  // 生命周期账本收集器（仅当指定 ledgerToken 时启用）
+  const ledger = trackToken ? {
+    token: trackToken,
+    points: new Map(), // key -> {kind, line, scope, cleanup, loops, paths}
+    exits: new Map(),  // 出口 -> {kind, line, stillHeld, released, neverHeld}
+    truncated: false,
+    truncation: null
+  } : null;
+
+  // 事件上下文：区分主流程 / 清理块（含嵌套深度）与循环轮次（iter/total 仅作账本标注，
+  // 不进入 stateKey，因此不改变既有穷尽与最短违规语义）
+  function eventContext(s) {
+    const loops = [];
+    let cleanup = null;
+    for (const r of s.ranges) {
+      if (r.kind === 'iter') {
+        loops.push({ line: I[r.s - 1].line, iter: r.iter != null ? r.iter : null, total: r.total != null ? r.total : null });
+      } else if (r.kind === 'cleanup') {
+        cleanup = { line: I[r.s - 1].line, depth: r.depth != null ? r.depth : null };
+      }
+    }
+    return { scope: cleanup ? 'cleanup' : 'main', cleanup, loops };
+  }
+
+  function ledgerEvent(kind, line, s, token) {
+    if (!ledger || token !== trackToken) return;
+    const ctx = eventContext(s);
+    const loopsKey = ctx.loops.map((l) => `${l.line}#${l.iter}/${l.total}`).join(',');
+    const key = `${kind}|${line}|${ctx.scope}|${ctx.cleanup ? ctx.cleanup.line + ':' + ctx.cleanup.depth : ''}|${loopsKey}`;
+    let rec = ledger.points.get(key);
+    if (!rec) {
+      rec = { kind, line, scope: ctx.scope, cleanup: ctx.cleanup, loops: ctx.loops, paths: 0 };
+      ledger.points.set(key, rec);
+    }
+    rec.paths += 1; // 可达路径数 = 执行到该点的规范状态数
+  }
+
+  function ledgerExit(s) {
+    if (!ledger) return;
+    const point = `${s.pendingExit}@${s.exitLine == null ? 'end' : s.exitLine}`;
+    let rec = ledger.exits.get(point);
+    if (!rec) {
+      rec = { kind: s.pendingExit, line: s.exitLine, stillHeld: 0, released: 0, neverHeld: 0 };
+      ledger.exits.set(point, rec);
+    }
+    if (s.held.has(trackToken)) rec.stillHeld += 1;
+    else if (s.touched) rec.released += 1;
+    else rec.neverHeld += 1;
+  }
 
   // 分层 FIFO：level d 的数组承载指令步数恰为 d 的状态；代价 0 的结构动作追加到当前层
   const levels = new Map([[0, { arr: [initial], i: 0 }]]);
@@ -272,7 +340,8 @@ function verify(scriptText, options = {}) {
       frames: s.frames,
       pendingExit: s.pendingExit,
       exitLine: s.exitLine,
-      pc: s.pc
+      pc: s.pc,
+      touched: s.touched
     };
   }
 
@@ -288,7 +357,7 @@ function verify(scriptText, options = {}) {
     }
     const s = lvl.arr[lvl.i++];
 
-    const key = stateKey(s);
+    const key = stateKey(s, !!trackToken);
     if (visited.has(key)) continue;
     visited.add(key);
     canonicalStates += 1;
@@ -350,7 +419,9 @@ function verify(scriptText, options = {}) {
           const ns = childOf(s);
           ns.held = cloneHeld(s.held, tokenNames);
           ns.held.add(ins.token);
+          if (ins.token === trackToken) ns.touched = true;
           ns.pc = s.pc + 1;
+          ledgerEvent('acquire', ins.line, s, ins.token);
           enqueue(s, ns, {
             kind: 'acquire', line: ins.line, token: ins.token,
             heldBefore: before, heldAfter: heldArray(ns.held), ok: true,
@@ -372,6 +443,7 @@ function verify(scriptText, options = {}) {
         } else {
           const ns = childOf(s);
           ns.pc = s.pc + 1;
+          ledgerEvent('operate', ins.line, s, ins.token);
           enqueue(s, ns, {
             kind: 'operate', line: ins.line, token: ins.token,
             heldBefore: heldArray(s.held), heldAfter: heldArray(s.held), ok: true,
@@ -396,6 +468,7 @@ function verify(scriptText, options = {}) {
           ns.held = cloneHeld(s.held, tokenNames);
           ns.held.delete(ins.token);
           ns.pc = s.pc + 1;
+          ledgerEvent('release', ins.line, s, ins.token);
           enqueue(s, ns, {
             kind: 'release', line: ins.line, token: ins.token,
             heldBefore: before, heldAfter: heldArray(ns.held), ok: true,
@@ -421,7 +494,7 @@ function verify(scriptText, options = {}) {
           if (k === 0) {
             ns.pc = ins.match + 1;
           } else {
-            ns.ranges.push({ s: s.pc + 1, e: ins.match, kind: 'iter', rem: k - 1, rejoin: ins.match + 1 });
+            ns.ranges.push({ s: s.pc + 1, e: ins.match, kind: 'iter', rem: k - 1, iter: 1, total: k, rejoin: ins.match + 1 });
             ns.pc = s.pc + 1;
           }
           enqueue(s, ns, {
@@ -484,6 +557,7 @@ function verify(scriptText, options = {}) {
       if (r.rem > 0) {
         const top = ns.ranges[ns.ranges.length - 1];
         top.rem = r.rem - 1;
+        top.iter = (r.iter != null ? r.iter : 1) + 1; // 账本标注：循环轮次（不影响 stateKey）
         ns.pc = top.s;
         enqueue(s, ns, {
           kind: 'loop-repeat',
@@ -516,7 +590,7 @@ function verify(scriptText, options = {}) {
     }
     ns.frames = cloneFrames(s.frames);
     const f = ns.frames.pop();
-    ns.ranges = [{ s: f.pc + 1, e: f.end, kind: 'cleanup' }];
+    ns.ranges = [{ s: f.pc + 1, e: f.end, kind: 'cleanup', depth: f.depth }]; // depth 供账本标注清理来源
     ns.pc = f.pc + 1;
     const cause = s.pendingExit === 'abort' ? '由 abort 触发'
       : s.pendingExit === 'return' ? '由 return 触发'
@@ -541,6 +615,7 @@ function verify(scriptText, options = {}) {
   function recordExit(s) {
     const held = heldArray(s.held);
     const clean = held.length === 0;
+    ledgerExit(s); // 账本：对该出口按 已释放/未曾持有/仍被持有 归类目标令牌
     const point = `${s.pendingExit}@${s.exitLine == null ? 'end' : s.exitLine}`;
     let rec = exitsByPoint.get(point);
     if (!rec) {
@@ -605,6 +680,51 @@ function verify(scriptText, options = {}) {
     return out.reverse();
   }
 
+  // 汇总账本：按源指令顺序（行号升序，同行按 获取→操作→释放）排列事件点；
+  // 释放点按主流程（显式释放）与清理续体（嵌套清理释放）分类；出口给出规范结论。
+  function buildLedgerResult() {
+    if (!ledger) return null;
+    const KIND_ORDER = { acquire: 0, operate: 1, release: 2 };
+    const loopSig = (p) => p.loops.map((l) => `${l.line}#${l.iter}/${l.total}`).join(',');
+    const points = [...ledger.points.values()].map((p) => ({
+      kind: p.kind,
+      category: p.kind === 'release'
+        ? (p.scope === 'cleanup' ? 'cleanup-release' : 'explicit-release')
+        : p.kind,
+      line: p.line,
+      scope: p.scope,
+      cleanup: p.cleanup,
+      loops: p.loops,
+      paths: p.paths
+    })).sort((a, b) =>
+      a.line - b.line ||
+      KIND_ORDER[a.kind] - KIND_ORDER[b.kind] ||
+      (a.scope === b.scope ? 0 : a.scope === 'main' ? -1 : 1) ||
+      ((a.cleanup ? a.cleanup.line : 0) - (b.cleanup ? b.cleanup.line : 0)) ||
+      (loopSig(a) < loopSig(b) ? -1 : loopSig(a) > loopSig(b) ? 1 : 0)
+    );
+    const exits = [...ledger.exits.values()].map((e) => ({
+      kind: e.kind,
+      line: e.line,
+      // 规范结论：任一路径仍持有 => 仍被持有；否则任一路径曾获取（并已释放）=> 已释放；否则未曾持有
+      conclusion: e.stillHeld > 0 ? 'still-held' : e.released > 0 ? 'released' : 'never-held',
+      stillHeld: e.stillHeld,
+      released: e.released,
+      neverHeld: e.neverHeld
+    })).sort((a, b) =>
+      ((a.line == null) - (b.line == null)) ||
+      ((a.line || 0) - (b.line || 0)) ||
+      a.kind.localeCompare(b.kind)
+    );
+    return {
+      token: ledger.token,
+      truncated: ledger.truncated,
+      truncation: ledger.truncation,
+      points,
+      exits
+    };
+  }
+
   function buildFailure(violState, states) {
     const trace = [];
     let cur = violState;
@@ -614,6 +734,16 @@ function verify(scriptText, options = {}) {
       cur = cur.parent;
     }
     trace.reverse();
+    if (ledger) {
+      // 违规脚本：账本只覆盖首条违规前已执行的生命周期，并记录截断原因
+      const v = violState.__violation || {};
+      ledger.truncated = true;
+      ledger.truncation = {
+        type: v.type || 'violation',
+        line: v.line != null ? v.line : null,
+        detail: v.detail || '发现违规，复核在此截断'
+      };
+    }
     return {
       ok: false,
       fatal: false,
@@ -623,7 +753,8 @@ function verify(scriptText, options = {}) {
       counterexample: {
         instructionSteps: trace.filter((st) => INSTRUCTION_STEPS.has(st.kind)).length,
         steps: trace
-      }
+      },
+      ...(ledger ? { ledger: buildLedgerResult() } : {})
     };
   }
 
@@ -648,7 +779,8 @@ function verify(scriptText, options = {}) {
       tokens: tokenNames.length,
       exits: exits.length
     },
-    exits
+    exits,
+    ...(ledger ? { ledger: buildLedgerResult() } : {})
   };
 }
 

@@ -8,7 +8,9 @@
  *      · 分支遗漏释放   · abort 触发嵌套清理   · 循环重复获取
  *      以及未知令牌 / 循环上界越限 / 非法跳出清理作用域的报错与旧证据移除；
  *   2) 构建检查：构建静态复核页到 dist/ 并校验关键要素；
- *   3) HTTP 冒烟：请求健康地址与静态页面；并通过 /api/verify 复核三个规定场景。
+ *   3) HTTP 冒烟：请求健康地址与静态页面；通过 /api/verify 复核三个规定场景，
+ *      并通过 /api/ledger 校验令牌生命周期账本（安全覆盖全部出口 / 违规截断 /
+ *      未知令牌拒绝）。
  *
  * 目标服务：
  *   - 设置 APP_BASE_URL（如 compose 网络中的 http://app:8080）时直接对其冒烟；
@@ -34,7 +36,7 @@ function runNodeTest() {
   const r = spawnSync(process.execPath, ['--test', 'test/'], {
     cwd: ROOT, stdio: 'inherit', encoding: 'utf8'
   });
-  record('代码测试（分支遗漏释放 / abort 嵌套清理 / 循环重复获取等 15 例）', r.status === 0,
+  record('代码测试（分支遗漏释放 / abort 嵌套清理 / 循环重复获取 / 生命周期账本等 23 例）', r.status === 0,
     r.status === 0 ? 'node --test 全部通过' : `退出码 ${r.status}`);
   return r.status === 0;
 }
@@ -176,6 +178,51 @@ async function runHttpSmoke(baseUrl) {
     try { body = JSON.parse(r.text); ok = sc.check(body); } catch {}
     record(sc.name, ok, ok ? 'API 判定符合预期' : `HTTP ${r.status}：${(body && (body.violation || body.error || {}).type) || '响应不符'}`);
   }
+
+  // 生命周期账本：安全脚本覆盖全部出口；违规脚本截断于首条违规；未知令牌明确拒绝
+  const ledgerScript = `acquire A
+if guard
+release A
+else
+operate A
+release A
+endif
+return`;
+  const lr = await request('POST', '/api/ledger', { script: ledgerScript, tokens: ['A'], token: 'A' }, base);
+  let lbody, lok = false;
+  try {
+    lbody = JSON.parse(lr.text);
+    lok = lr.status === 200 && lbody.ok && lbody.ledger && !lbody.ledger.truncated &&
+      lbody.ledger.points.some((p) => p.category === 'acquire' && p.line === 1) &&
+      lbody.ledger.points.some((p) => p.category === 'explicit-release' && p.line === 3) &&
+      lbody.ledger.points.some((p) => p.category === 'explicit-release' && p.line === 6) &&
+      lbody.ledger.exits.some((e) => e.kind === 'return' && e.conclusion === 'released');
+  } catch {}
+  record('HTTP 账本：安全脚本 => 获取/显式释放点齐全，出口结论 已释放', lok,
+    lok ? '账本点与出口结论符合预期' : `HTTP ${lr.status}`);
+
+  const lt = await request('POST', '/api/ledger', {
+    script: 'loop 3\nacquire A\noperate A\nendloop\nreturn', tokens: ['A'], token: 'A'
+  }, base);
+  let tbody, tok = false;
+  try {
+    tbody = JSON.parse(lt.text);
+    tok = lt.status === 200 && !tbody.ok && tbody.ledger && tbody.ledger.truncated &&
+      tbody.ledger.truncation && tbody.ledger.truncation.type === 'double-acquire' &&
+      tbody.ledger.points.every((p) => p.kind !== 'release');
+  } catch {}
+  record('HTTP 账本：违规脚本 => 截断于首条违规并标明原因', tok,
+    tok ? '截断原因 double-acquire 正确' : `HTTP ${lt.status}`);
+
+  const lu = await request('POST', '/api/ledger', { script: 'acquire A', tokens: ['A'], token: 'ZZ' }, base);
+  let ubody, uok = false;
+  try {
+    ubody = JSON.parse(lu.text);
+    uok = lu.status === 422 && ubody.fatal && ubody.error && ubody.error.type === 'unknown-token' &&
+      !ubody.ledger;
+  } catch {}
+  record('HTTP 账本：令牌不在当前令牌表 => 明确拒绝且不生成账本', uok,
+    uok ? '422 unknown-token' : `HTTP ${lu.status}`);
 }
 
 async function main() {

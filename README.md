@@ -17,6 +17,13 @@
 - 违规证据：按**最短指令步数**（0-1 分层 FIFO）、同长度**保持源序**
   （TRUE 先于 FALSE，循环次数升序）给出完整逐步路径、令牌变化与清理展开。
 - 安全结论：报告**已穷尽的规范状态数**及各出口（return/abort/自然结束）的清理结果。
+- **令牌生命周期账本**：复核完成后可在结果页选择令牌，针对当前已完成复核生成账本——
+  按源指令顺序汇总该令牌的获取点、操作点、显式释放点、嵌套清理释放点及各自
+  可达路径数（按规范状态计）；循环内不同轮次、清理块中的同名令牌来源分别标明；
+  每个出口给出该令牌**已释放 / 未曾持有 / 仍被持有**的规范结论。
+  违规脚本的账本只覆盖**首条违规前已执行的生命周期**并标明截断原因；
+  安全脚本覆盖全部穷尽出口。令牌不在当前令牌表、复核尚未完成、重新复核或清空后，
+  页面显示明确原因且不展示旧账本。
 - **未知令牌、循环上界越限、非法跳出/穿越清理作用域**直接报错并标记
   `evidenceRemoved`（旧证据作废）；发现违规时同样移除旧安全证据。
 
@@ -25,7 +32,7 @@
 ```bash
 npm start                 # 默认 0.0.0.0:8080，健康地址 /healthz
 HOST=127.0.0.1 PORT=8091 HEALTH_PATH=/ready npm start
-npm test                  # 代码测试（node --test，15 例）
+npm test                  # 代码测试（node --test，23 例）
 npm run build             # 构建静态复核页到 dist/
 npm run verify            # 一次性验收：测试 + 构建 + HTTP 冒烟，退出码报告
 ```
@@ -51,5 +58,20 @@ docker compose run --rm verify   # 仅跑一次性验收服务（退出码报告
 | GET | `/healthz`（可用 `HEALTH_PATH` 配置） | 健康地址 |
 | GET | `/`、`/static/index.html` | 静态复核页 |
 | POST | `/api/verify` | `{script, tokens, maxLoop?}` 穷尽复核 |
+| POST | `/api/ledger` | `{script, tokens, token, maxLoop?}` 指定令牌的生命周期账本 |
 | POST | `/api/clear` | 清空草稿与结论（旧证据移除确认） |
 | GET | `/api/meta` | 令牌/指令上限 |
+
+### 生命周期账本（`/api/ledger`）
+
+- 复用同一套穷尽机重新展开同一输入，并追踪指定令牌：账本点含
+  `acquire` / `operate` / `explicit-release` / `cleanup-release` 四类，
+  按源指令行号排序，各自给出可达路径数（执行到该点的规范状态数）。
+- 账本模式下规范状态额外区分「目标令牌是否曾获取」与「循环所选总次数」，
+  因此循环不同轮次、清理块（含嵌套深度）中的同名令牌来源分别标明；
+  普通 `/api/verify` 的规范状态定义与结论不受影响。
+- 出口结论：`released`（已释放）/ `never-held`（未曾持有）/ `still-held`（仍被持有），
+  并附各分类路径计数；存在仍被持有路径时结论为 `still-held`。
+- 脚本违规时 `ledger.truncated = true` 并给出 `truncation`（类型/行号/详情），
+  账本仅含首条违规前已执行的生命周期；安全脚本 `truncated = false`，覆盖全部穷尽出口。
+- 令牌不在当前令牌表：HTTP 422 + `unknown-token`，不生成账本。

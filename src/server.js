@@ -101,6 +101,42 @@ function createServer() {
       return;
     }
 
+    // 生命周期账本：针对已完成复核的指定令牌，按同一输入重新穷尽并汇总
+    // 获取/操作/显式释放/嵌套清理释放点与出口结论；违规脚本只覆盖首条违规前的生命周期
+    if (req.method === 'POST' && p === '/api/ledger') {
+      let payload;
+      try {
+        const text = await readBody(req);
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        sendJson(res, 400, { ok: false, fatal: true,
+          error: { type: 'bad-request', message: '请求体不是合法 JSON' } });
+        return;
+      }
+      const token = payload.token == null ? '' : String(payload.token).trim();
+      if (!token) {
+        sendJson(res, 422, { ok: false, fatal: true,
+          error: { type: 'missing-ledger-token', message: '未指定要生成生命周期账本的令牌' } });
+        return;
+      }
+      // 令牌不在当前令牌表：仅拒绝本次账本请求并说明原因，不影响已完成的复核结论
+      const tokenNames = (Array.isArray(payload.tokens) ? payload.tokens : [])
+        .map((t) => String(t).trim()).filter(Boolean);
+      if (!tokenNames.includes(token)) {
+        sendJson(res, 422, { ok: false, fatal: true,
+          error: { type: 'unknown-token',
+            message: `令牌「${token}」不在当前令牌表（当前令牌表: ${tokenNames.join(', ') || '∅'}）` } });
+        return;
+      }
+      const result = verify(payload.script == null ? '' : String(payload.script), {
+        tokenNames: Array.isArray(payload.tokens) ? payload.tokens : [],
+        maxLoop: payload.maxLoop == null ? undefined : Number(payload.maxLoop),
+        ledgerToken: token
+      });
+      sendJson(res, result.fatal ? 422 : 200, result);
+      return;
+    }
+
     // 清空草稿与结论（服务端无会话状态：确认旧证据已移除）
     if (req.method === 'POST' && p === '/api/clear') {
       sendJson(res, 200, { cleared: true, evidenceRemoved: true });
