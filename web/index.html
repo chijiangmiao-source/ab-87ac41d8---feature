@@ -77,6 +77,25 @@
   summary { cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .errbox { font-family: ui-monospace,monospace; font-size: 12.5px; color: var(--warn);
     background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 10px; margin-top: 8px; }
+  .ledger { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px; }
+  .ledger h3 { color: var(--accent); margin-top: 4px; }
+  .ledger-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .ledger-bar select { width: auto; min-width: 130px; background: var(--panel2); color: var(--txt);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit; }
+  button.mini { padding: 7px 14px; font-size: 13px; }
+  .ledger-note { border: 1px solid var(--line); background: var(--panel2); border-radius: 8px;
+    padding: 10px 12px; color: var(--dim); font-size: 12.5px; margin-top: 8px; }
+  .ledger-note.warn { border-color: var(--warn); color: var(--warn); background: rgba(255,176,32,.07); }
+  .origin { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .origin .tag { border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font-size: 11px;
+    font-family: ui-monospace,monospace; background: var(--panel2); color: var(--violet); }
+  .origin .tag.cleanup { color: var(--accent); }
+  .origin .tag.main { color: var(--dim); }
+  .concl.released { color: var(--ok); }
+  .concl.never-held { color: var(--dim); }
+  .concl.still-held { color: var(--bad); font-weight: 700; }
+  .concl.released-or-never { color: var(--ok); }
+  .paths b { color: var(--txt); }
 </style>
 </head>
 <body>
@@ -116,6 +135,7 @@ return"></textarea>
     <section class="panel">
       <h2>复核结论</h2>
       <div id="result"><div class="empty">尚未复核：提交后此处展示穷尽结果、逐步路径、令牌变化与清理展开。</div></div>
+      <div id="ledger"></div>
     </section>
   </div>
 </main>
@@ -128,6 +148,11 @@ const tokenRow = document.getElementById('tokenRow');
 const scriptEl = document.getElementById('script');
 const counterEl = document.getElementById('counter');
 const resultEl = document.getElementById('result');
+const ledgerEl = document.getElementById('ledger');
+
+// 当前已完成复核的快照；账本只能基于未失效的快照生成
+let lastReview = null; // { script, tokens, status: 'safe'|'unsafe' }
+let ledgerBusy = false;
 
 for (let i = 0; i < TOKEN_COUNT; i++) {
   const inp = document.createElement('input');
@@ -156,7 +181,20 @@ function refreshCounter() {
   counterEl.textContent = n + ' / ' + MAX_INSTR + ' 条指令';
   counterEl.classList.toggle('over', n > MAX_INSTR);
 }
-scriptEl.addEventListener('input', refreshCounter);
+scriptEl.addEventListener('input', () => {
+  refreshCounter();
+  markDraftStale();
+});
+tokenRow.addEventListener('input', markDraftStale);
+
+function markDraftStale() {
+  if (!lastReview) return;
+  lastReview = null;
+  ledgerEl.innerHTML =
+    '<div class="ledger"><div class="ledger-note warn" data-ledger-note>' +
+    '草稿（指令或令牌表）自上次复核后已修改：旧账本与结论快照已失效，且不得再展示旧账本。' +
+    '请重新提交复核后再生成生命周期账本。</div></div>';
+}
 
 document.getElementById('btnVerify').addEventListener('click', submitVerify);
 document.getElementById('btnClear').addEventListener('click', clearAll);
@@ -180,8 +218,12 @@ function chips(before, after) {
 
 async function submitVerify() {
   const tokens = getTokens();
-  const payload = { script: scriptEl.value, tokens };
+  const script = scriptEl.value;
+  const payload = { script, tokens };
   resultEl.innerHTML = '<div class="empty">正在穷尽展开全部控制路径…</div>';
+  // 重新复核：任何旧结论与旧账本在新复核完成前一律视为失效，不得展示
+  lastReview = null;
+  ledgerEl.innerHTML = '';
   let r;
   try {
     const resp = await fetch('/api/verify', {
@@ -195,6 +237,13 @@ async function submitVerify() {
     return;
   }
   render(r);
+  // 复核已完成（安全或发现违规）：以本次请求快照作为账本入口的依据
+  if (!r.fatal) {
+    lastReview = { script, tokens, status: r.ok ? 'safe' : 'unsafe' };
+    ledgerEl.innerHTML = ledgerSkeleton();
+  } else {
+    ledgerEl.innerHTML = '';
+  }
 }
 
 async function clearAll() {
@@ -202,6 +251,9 @@ async function clearAll() {
   tokenRow.querySelectorAll('input').forEach((el) => { el.value = ''; el.disabled = false; });
   refreshCounter();
   resultEl.innerHTML = '<div class="empty">草稿与结论已清空，旧证据已移除。</div>';
+  // 清空后旧结果失效：必须移除旧账本，不得继续展示
+  lastReview = null;
+  ledgerEl.innerHTML = '';
   try { await fetch('/api/clear', { method: 'POST' }); } catch {}
 }
 
@@ -281,6 +333,145 @@ function renderSafe(r) {
     '<h3>各出口清理结果（return / abort / 自然结束）</h3>' +
     '<table><tr><th>出口</th><th>清理结论</th><th>清理后持有</th><th>清理续体展开</th></tr>' +
     (exits || '<tr><td colspan="4" class="muted">脚本无任何可达出口</td></tr>') + '</table>';
+}
+
+/* ---------------- 单令牌生命周期账本 ---------------- */
+
+function ledgerSkeleton() {
+  if (!lastReview) return '';
+  const opts = lastReview.tokens.map((t) =>
+    '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('');
+  return '<div class="ledger"><h3>令牌生命周期账本（当前已完成' +
+    (lastReview.status === 'safe' ? '的安全复核' : '、发现违规的复核') + '）</h3>' +
+    '<div class="ledger-bar"><label style="margin:0">选择令牌</label>' +
+    '<select id="ledgerToken">' + opts + '</select>' +
+    '<button class="primary mini" id="btnLedger">生成生命周期账本</button></div>' +
+    '<div class="ledger-note" data-ledger-note>针对指定令牌按源指令顺序汇总获取点、操作点、显式释放点与嵌套清理释放点，' +
+    '标注循环轮次与清理块来源，并对每个出口给出「已释放 / 未曾持有 / 仍被持有」的规范结论。' +
+    (lastReview.status === 'unsafe'
+      ? '当前脚本存在违规：账本仅覆盖首条违规前已执行的生命周期，并会标明截断原因。'
+      : '当前脚本安全：账本覆盖全部穷尽出口。') +
+    '</div><div id="ledgerBody"></div></div>';
+}
+
+ledgerEl.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'btnLedger') requestLedger();
+});
+
+async function requestLedger() {
+  if (!lastReview || ledgerBusy) return;
+  const sel = document.getElementById('ledgerToken');
+  const token = sel ? sel.value : '';
+  if (!token) return;
+  if (!lastReview.tokens.includes(token)) {
+    renderLedgerInvalid('令牌「' + token + '」不在当前令牌表中，不能生成账本。');
+    return;
+  }
+  const bodyEl = document.getElementById('ledgerBody');
+  const btn = document.getElementById('btnLedger');
+  ledgerBusy = true;
+  if (btn) btn.disabled = true;
+  if (bodyEl) bodyEl.innerHTML = '<div class="empty">正在按细化状态（循环轮次 / 清理登记上下文）汇总生命周期…</div>';
+  let r;
+  try {
+    const resp = await fetch('/api/ledger', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ script: lastReview.script, tokens: lastReview.tokens, token })
+    });
+    r = await resp.json();
+  } catch (e2) {
+    if (bodyEl) bodyEl.innerHTML = '<div class="ledger-note warn">账本服务不可用：' + esc(e2.message) + '</div>';
+  } finally {
+    ledgerBusy = false;
+    if (btn) btn.disabled = false;
+  }
+  if (r) renderLedger(r, token);
+}
+
+function renderLedgerInvalid(msg) {
+  const bodyEl = document.getElementById('ledgerBody');
+  if (bodyEl) bodyEl.innerHTML = '<div class="ledger-note warn">' + esc(msg) + ' 不展示任何旧账本。</div>';
+}
+
+function originTags(ctx, blocks) {
+  const tags = [];
+  (ctx || []).forEach((c) => {
+    if (c.type === 'loop') tags.push('<span class="tag">循环 L' + c.line + ' · 第 ' + c.round + ' 轮</span>');
+    else tags.push('<span class="tag cleanup">清理块 L' + c.line + '（嵌套深度 ' + c.depth + '）内执行</span>');
+  });
+  (blocks || []).forEach((b) => {
+    if ((ctx || []).some((c) => c.type === 'cleanup' && c.line === b.line)) return;
+    tags.push('<span class="tag cleanup">文本作用域：清理块 L' + b.line + '</span>');
+  });
+  if (!tags.length) tags.push('<span class="tag main">顶层主流程</span>');
+  return '<span class="origin">' + tags.join('') + '</span>';
+}
+
+const POINT_META = {
+  acquire: ['获取点', 'var(--ok)'],
+  operate: ['操作点', 'var(--violet)'],
+  release: ['显式释放点', 'var(--warn)'],
+  'cleanup-release': ['嵌套清理释放点', 'var(--accent)']
+};
+
+function renderLedger(r, token) {
+  const bodyEl = document.getElementById('ledgerBody');
+  if (!bodyEl) return;
+  if (r.fatal) {
+    bodyEl.innerHTML = '<div class="ledger-note warn">无法生成令牌「' + esc(token) +
+      '」的生命周期账本：' + esc(r.error.message) + '（' + esc(r.error.type) +
+      '）。旧账本不作展示。</div>';
+    return;
+  }
+
+  const banner = r.truncated
+    ? '<div class="ledger-note warn"><b>账本已截断：</b>' +
+      esc(r.cutoff && r.cutoff.violation ? r.cutoff.violation.detail : '脚本存在违规') +
+      (r.cutoff && r.cutoff.violation && r.cutoff.violation.type
+        ? '（首条违规类型 <code>' + esc(r.cutoff.violation.type) + '</code>' +
+          (r.cutoff.violation.line != null ? '，第 ' + r.cutoff.violation.line + ' 行' : '') +
+          (r.cutoff.instructionSteps != null ? '，最短违规指令步数 ' + r.cutoff.instructionSteps : '') + '）' : '') +
+      '<div style="margin-top:6px">' + esc(r.cutoff.note) + '</div></div>'
+    : '<div class="ledger-note">脚本安全：账本覆盖全部穷尽出口（' +
+      '<b style="color:var(--ok)">' + r.stats.pathsToExits + '</b> 条具体控制路径）。</div>';
+
+  const rows = (r.points || []).map((p, i) => {
+    const meta = POINT_META[p.kind] || [p.kind, ''];
+    return '<tr><td>' + (i + 1) + '</td>' +
+      '<td>L' + p.line + '</td>' +
+      '<td style="color:' + meta[1] + '">' + meta[0] + '</td>' +
+      '<td>' + originTags(p.context, p.cleanupBlocks) + '</td>' +
+      '<td class="paths"><b>' + p.paths + '</b> 条</td></tr>';
+  }).join('');
+
+  const exitRows = (r.exits || []).map((e) => {
+    let name;
+    if (e.kind === 'fall-through') name = '自然结束';
+    else name = (e.kind === 'return' ? 'return' : 'abort') +
+      (e.line != null ? '（第 ' + e.line + ' 行）' : '');
+    return '<tr><td><b>' + esc(name) + '</b></td>' +
+      '<td class="' + (e.released ? 'released' : '') + '">' + e.released + '</td>' +
+      '<td class="' + (e.neverHeld ? 'never-held' : '') + '">' + e.neverHeld + '</td>' +
+      '<td class="' + (e.stillHeld ? 'still-held' : '') + '">' + e.stillHeld + '</td>' +
+      '<td><span class="concl ' + esc(e.conclusion.code) + '">' + esc(e.conclusion.text) + '</span></td></tr>';
+  }).join('');
+
+  bodyEl.innerHTML =
+    banner +
+    '<div class="stats">' +
+    '<span>令牌<b>' + esc(r.token) + '</b></span>' +
+    '<span>穷尽出口路径<b>' + r.stats.pathsToExits + '</b></span>' +
+    (r.truncated ? '<span>到达首条违规路径<b>' + r.stats.pathsToViolation + '</b></span>' : '') +
+    '<span>细化规范状态<b>' + r.stats.refinedStates + '</b></span>' +
+    '<span>主复核规范状态<b>' + r.stats.canonicalStates + '</b></span></div>' +
+    '<h3>生命周期事件（按源指令顺序；循环各轮次与清理块同名来源分列）</h3>' +
+    '<table><tr><th>序</th><th>源行</th><th>事件点</th><th>来源标注</th><th>可达路径数</th></tr>' +
+    (rows || '<tr><td colspan="5" class="muted">截断范围内该令牌没有任何获取 / 操作 / 释放事件。</td></tr>') +
+    '</table>' +
+    '<h3>各出口对令牌「' + esc(r.token) + '」的规范结论</h3>' +
+    '<table><tr><th>出口</th><th>已释放路径</th><th>未曾持有路径</th><th>仍被持有路径</th><th>结论</th></tr>' +
+    (exitRows || '<tr><td colspan="5" class="muted">截断范围内尚无任何已形成出口。</td></tr>') +
+    '</table>';
 }
 </script>
 </body>

@@ -652,9 +652,534 @@ function verify(scriptText, options = {}) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* 单令牌生命周期账本                                                  */
+/*   针对某个已复核脚本中的指定令牌，按源指令顺序汇总：                 */
+/*   获取点 / 操作点 / 显式释放点 / 嵌套清理释放点，及各点可达路径数； */
+/*   循环不同轮次、清理块（含循环中逐轮登记）的同名来源分别标注；       */
+/*   每个出口给出该令牌 已释放 / 未曾持有 / 仍被持有 的规范结论。      */
+/*                                                                    */
+/*   做法：在与主复核同一套抽象机语义上做“细化状态”遍历——状态上额外    */
+/*   携带各活动循环帧的轮次（1 基）与清理续体登记时的上下文快照，       */
+/*   从而把主复核合并的 (总次数 k, 轮次 r) 状态拆开；遍历形成 DAG，    */
+/*   以路径多重度（初始 1，边沿逐条累加）计数具体控制路径。            */
+/*   违规脚本在分层 FIFO 弹出的首个违规态处截断，只统计此前已闭合的    */
+/*   生命周期事件与已形成出口；安全脚本覆盖全部穷尽出口。              */
+/* ------------------------------------------------------------------ */
+
+function computeStaticScopes(I) {
+  const stack = [];
+  for (let i = 0; i < I.length; i++) {
+    const ins = I[i];
+    ins.scopeLoops = stack.filter((x) => x.kind === 'loop').map((x) => x.line);
+    ins.scopeCleanups = stack.filter((x) => x.kind === 'cleanup')
+      .map((x) => ({ line: x.line, depth: x.depth }));
+    if (ins.kind === 'loop') stack.push({ kind: 'loop', line: ins.line });
+    else if (ins.kind === 'cleanup') stack.push({ kind: 'cleanup', line: ins.line, depth: ins.cleanupDepth });
+    else if (ins.kind === 'if') stack.push({ kind: 'if', line: ins.line });
+    else if (ins.kind === 'endif' || ins.kind === 'endloop' || ins.kind === 'endcleanup') stack.pop();
+  }
+}
+
+function contextKey(ctx) {
+  return ctx.map((c) => (c.type === 'loop'
+    ? `L${c.line}r${c.round}`
+    : `C${c.line}d${c.depth}`)).join('>');
+}
+function snapshotContext(ranges) {
+  const out = [];
+  for (const r of ranges) {
+    if (r.kind === 'iter') out.push({ type: 'loop', line: r.loopLine, round: r.round });
+    else if (r.kind === 'cleanup') {
+      for (const c of r.regContext) out.push({ ...c });
+      out.push({ type: 'cleanup', line: r.frameLine, depth: r.depth });
+    }
+  }
+  return out;
+}
+
+function buildLedger(scriptText, options = {}) {
+  const base = verify(scriptText, options);
+  if (base.fatal) return base;
+
+  const tokenNames = [];
+  const seenName = new Set();
+  for (const raw of options.tokenNames || []) {
+    const t = String(raw).trim();
+    if (!t) continue;
+    if (!seenName.has(t)) { seenName.add(t); tokenNames.push(t); }
+  }
+  const T = String(options.token == null ? '' : options.token).trim();
+  if (!tokenNames.includes(T)) {
+    return fatal('ledger-token-not-declared', `令牌「${T}」不在当前令牌表中，无法生成生命周期账本`);
+  }
+
+  let I;
+  try {
+    I = parse(scriptText, { names: tokenNames, maxLoop: options.maxLoop });
+  } catch (e) {
+    if (e instanceof ParseError) return fatal(e.code, e.message, e.line);
+    throw e;
+  }
+  computeStaticScopes(I);
+
+  const heldList = (held) => tokenNames.filter((t) => held.has(t));
+  const cloneHeld2 = (held) => new Set(held);
+  const cloneRanges2 = (rs) => rs.map((r) => ({ ...r, regContext: r.regContext ? r.regContext.map((c) => ({ ...c })) : undefined }));
+  const cloneFrames2 = (fs) => fs.map((f) => ({
+    ...f,
+    registeredHeld: f.registeredHeld.slice(),
+    regContext: f.regContext.map((c) => ({ ...c }))
+  }));
+
+  function stateKey2(s) {
+    return s.ranges.map((r, i) => {
+      let part = r.kind[0] + r.s + '-' + r.e;
+      if (r.kind === 'iter') part += 'x' + r.rem + 'r' + r.round + 'L' + r.loopLine;
+      if (r.kind === 'cleanup') part += '!L' + r.frameLine + 'd' + r.depth + 'c' + contextKey(r.regContext);
+      if (i === s.ranges.length - 1) part += '@' + s.pc;
+      return part;
+    }).join('/') +
+      '||' + heldList(s.held).join(',') +
+      '||' + s.frames.map((f) =>
+        `${f.pc}#${f.depth}:${f.registeredHeld.join('.')}@${contextKey(f.regContext)}`).join('>') +
+      '||' + (s.pendingExit || '-') + '||ever' + (s.everT ? 1 : 0);
+  }
+
+  const initial = {
+    ranges: [{ s: 0, e: I.length, kind: 'main' }],
+    held: new Set(),
+    frames: [],
+    pendingExit: null,
+    exitLine: null,
+    everT: false,
+    pc: 0
+  };
+
+  const nodes = new Map(); // key -> { closed, event, exit, violation }
+  const edges = [];
+  let nodeCap = 0;
+  let cutoff = null;
+
+  function remember(s) {
+    const k = stateKey2(s);
+    let node = nodes.get(k);
+    if (!node) {
+      node = { s: k, closed: false, event: null, exit: null, violation: null, _state: s };
+      nodes.set(k, node);
+      nodeCap += 1;
+    }
+    return [k, node];
+  }
+  const [initialKey] = remember(initial);
+
+  // 分层 FIFO（与主复核同序：TRUE 先于 FALSE、循环次数升序），用于定位首条违规截断点
+  const levels = new Map([[0, { arr: [{ key: initialKey, state: initial }], i: 0 }]]);
+  let dist = 0;
+
+  function enqueue(parentState, parentKey, ns, step, event) {
+    const w = step && INSTRUCTION_STEPS.has(step.kind) ? 1 : 0;
+    const d = dist + w;
+    let lvl = levels.get(d);
+    if (!lvl) { lvl = { arr: [], i: 0 }; levels.set(d, lvl); }
+    const [k, node] = remember(ns);
+    // 生命周期事件挂在“执行指令之后”的子节点上（指令代价 1）：
+    // 截断于首条违规时，同距离但源序靠后、尚未弹出的节点上的事件不会被误纳入
+    if (event && !node.event) node.event = event;
+    lvl.arr.push({ key: k, state: ns });
+    edges.push([parentKey, k]);
+  }
+
+  function childOf(s) {
+    return {
+      ranges: s.ranges, held: s.held, frames: s.frames,
+      pendingExit: s.pendingExit, exitLine: s.exitLine, everT: s.everT, pc: s.pc
+    };
+  }
+
+  function eventKind(ins) {
+    if (ins.kind === 'release') {
+      return ins.scopeCleanups.length ? 'cleanup-release' : 'release';
+    }
+    return ins.kind; // acquire / operate
+  }
+
+  function closeViolation(s, violation) {
+    return {
+      ranges: [], frames: [], held: cloneHeld2(s.held), everT: s.everT,
+      pendingExit: 'violation', exitLine: s.exitLine, pc: s.pc, __violation: violation
+    };
+  }
+
+  /* eslint no-labels: off */
+  ledgerBfs:
+  for (;;) {
+    let lvl = levels.get(dist);
+    if (!lvl || lvl.i >= lvl.arr.length) {
+      const next = levels.get(dist + 1);
+      if (!next) break;
+      dist += 1;
+      continue;
+    }
+    if (nodeCap > MAX_STATES) {
+      return fatal('ledger-state-limit', `生命周期账本的细化状态数超出上限 ${MAX_STATES}（请收窄循环展开上界后重试）`);
+    }
+    const { key, state: s } = lvl.arr[lvl.i++];
+    const node = nodes.get(key);
+    if (node.closed) continue;
+    node.closed = true;
+
+    if (s.pendingExit === 'violation') {
+      node.violation = s.__violation;
+      cutoff = { violation: s.__violation, atDistance: dist };
+      break ledgerBfs;
+    }
+
+    if (s.ranges.length === 0) {
+      if (s.frames.length) {
+        continueChain(s, key);
+      } else {
+        node.exit = { kind: s.pendingExit, line: s.exitLine, heldT: s.held.has(T), everT: s.everT };
+        // 与主复核一致：出口仍持有任何令牌 => 再压入违规态（token-leaked）
+        if (s.held.size > 0) {
+          const heldNow = heldList(s.held);
+          const v = {
+            type: 'token-leaked', line: s.exitLine, exit: s.pendingExit, tokens: heldNow.slice(),
+            detail: `出口且全部清理续体执行完毕后仍持有令牌: ${heldNow.join(', ')}`
+          };
+          enqueue(s, key, closeViolation(s, v), {
+            kind: 'exit', line: s.exitLine, exit: s.pendingExit, heldBefore: heldNow, heldAfter: heldNow
+          });
+        }
+      }
+      continue;
+    }
+
+    const r = s.ranges[s.ranges.length - 1];
+    if (s.pc >= r.e) {
+      endRange(s, key, r);
+      continue;
+    }
+
+    const ins = I[s.pc];
+
+    if (ins.kind === 'return' || ins.kind === 'abort') {
+      const ns = childOf(s);
+      ns.ranges = [];
+      ns.pendingExit = ins.kind;
+      ns.exitLine = ins.line;
+      enqueue(s, key, ns, { kind: ins.kind, line: ins.line });
+      continue;
+    }
+
+    switch (ins.kind) {
+      case 'acquire': {
+        if (s.held.has(ins.token)) {
+          enqueue(s, key, closeViolation(s, {
+            type: 'double-acquire', line: ins.line, token: ins.token,
+            detail: `重复获取已持有的令牌「${ins.token}」`
+          }), { kind: 'acquire', line: ins.line, token: ins.token });
+        } else {
+          const ns = childOf(s);
+          ns.held = cloneHeld2(s.held);
+          ns.held.add(ins.token);
+          if (ins.token === T) ns.everT = true;
+          ns.pc = s.pc + 1;
+          const ev = ins.token === T
+            ? { index: s.pc, line: ins.line, kind: eventKind(ins),
+                context: snapshotContext(s.ranges), cleanupBlocks: ins.scopeCleanups.map((c) => ({ ...c })) }
+            : null;
+          enqueue(s, key, ns, { kind: 'acquire', line: ins.line, token: ins.token }, ev);
+        }
+        break;
+      }
+      case 'operate': {
+        if (!s.held.has(ins.token)) {
+          enqueue(s, key, closeViolation(s, {
+            type: 'operate-without-token', line: ins.line, token: ins.token,
+            detail: `操作了当前未持有的令牌「${ins.token}」`
+          }), { kind: 'operate', line: ins.line, token: ins.token });
+        } else {
+          const ns = childOf(s);
+          ns.pc = s.pc + 1;
+          const ev = ins.token === T
+            ? { index: s.pc, line: ins.line, kind: eventKind(ins),
+                context: snapshotContext(s.ranges), cleanupBlocks: ins.scopeCleanups.map((c) => ({ ...c })) }
+            : null;
+          enqueue(s, key, ns, { kind: 'operate', line: ins.line, token: ins.token }, ev);
+        }
+        break;
+      }
+      case 'release': {
+        if (!s.held.has(ins.token)) {
+          enqueue(s, key, closeViolation(s, {
+            type: 'release-without-token', line: ins.line, token: ins.token,
+            detail: `释放了当前未持有的令牌「${ins.token}」`
+          }), { kind: 'release', line: ins.line, token: ins.token });
+        } else {
+          const ns = childOf(s);
+          ns.held = cloneHeld2(s.held);
+          ns.held.delete(ins.token);
+          ns.pc = s.pc + 1;
+          const ev = ins.token === T
+            ? { index: s.pc, line: ins.line, kind: eventKind(ins),
+                context: snapshotContext(s.ranges), cleanupBlocks: ins.scopeCleanups.map((c) => ({ ...c })) }
+            : null;
+          enqueue(s, key, ns, { kind: 'release', line: ins.line, token: ins.token }, ev);
+        }
+        break;
+      }
+      case 'if': {
+        const elseAt = ins.elseIndex;
+        const endAt = ins.match;
+        branch(s, key, true, s.pc + 1, elseAt != null ? elseAt : endAt, endAt);
+        if (elseAt != null) branch(s, key, false, elseAt + 1, endAt, endAt);
+        else branch(s, key, false, endAt, endAt, endAt);
+        break;
+      }
+      case 'loop': {
+        for (let k = 0; k <= ins.expanded; k++) {
+          const ns = childOf(s);
+          ns.ranges = cloneRanges2(s.ranges);
+          if (k === 0) {
+            ns.pc = ins.match + 1;
+          } else {
+            ns.ranges.push({
+              s: s.pc + 1, e: ins.match, kind: 'iter', rem: k - 1, round: 1,
+              rejoin: ins.match + 1, loopLine: ins.line, regContext: null
+            });
+            ns.pc = s.pc + 1;
+          }
+          enqueue(s, key, ns, { kind: 'loop-choice', line: ins.line, times: k });
+        }
+        break;
+      }
+      case 'cleanup': {
+        const before = heldList(s.held);
+        const ns = childOf(s);
+        ns.frames = cloneFrames2(s.frames);
+        const depth = ins.cleanupDepth || ns.frames.length + 1;
+        ns.frames.push({
+          pc: s.pc, end: ins.match, depth, registeredHeld: before.slice(),
+          line: ins.line, regContext: snapshotContext(s.ranges)
+        });
+        ns.pc = ins.match + 1;
+        enqueue(s, key, ns, { kind: 'cleanup-register', line: ins.line, depth });
+        break;
+      }
+      default: {
+        const ns = childOf(s);
+        ns.pc = s.pc + 1;
+        enqueue(s, key, ns, null);
+      }
+    }
+  }
+
+  function branch(parent, parentKey, value, bodyS, bodyE, endAt) {
+    const ns = childOf(parent);
+    ns.ranges = cloneRanges2(parent.ranges);
+    if (bodyS < bodyE) {
+      ns.ranges.push({ s: bodyS, e: bodyE, kind: 'branch', rejoin: endAt + 1, regContext: null });
+      ns.pc = bodyS;
+    } else {
+      ns.pc = endAt + 1;
+    }
+    enqueue(parent, parentKey, ns, { kind: 'condition', value });
+  }
+
+  function endRange(s, key, r) {
+    if (r.kind === 'branch') {
+      const ns = childOf(s);
+      ns.ranges = cloneRanges2(s.ranges);
+      ns.ranges.pop();
+      ns.pc = r.rejoin;
+      enqueue(s, key, ns, null);
+    } else if (r.kind === 'iter') {
+      const ns = childOf(s);
+      ns.ranges = cloneRanges2(s.ranges);
+      if (r.rem > 0) {
+        const top = ns.ranges[ns.ranges.length - 1];
+        top.rem = r.rem - 1;
+        top.round = r.round + 1;
+        ns.pc = top.s;
+        enqueue(s, key, ns, { kind: 'loop-repeat' });
+      } else {
+        ns.ranges.pop();
+        ns.pc = r.rejoin;
+        enqueue(s, key, ns, null);
+      }
+    } else if (r.kind === 'cleanup') {
+      continueChain(s, key);
+    } else if (r.kind === 'main') {
+      const ns = childOf(s);
+      ns.ranges = [];
+      ns.pendingExit = 'fall-through';
+      enqueue(s, key, ns, null);
+    }
+  }
+
+  function continueChain(s, key) {
+    const frame = s.frames[s.frames.length - 1];
+    const ns = childOf(s);
+    if (!frame) {
+      ns.ranges = [];
+      enqueue(s, key, ns, null);
+      return;
+    }
+    ns.frames = cloneFrames2(s.frames);
+    const f = ns.frames.pop();
+    ns.ranges = [{
+      s: f.pc + 1, e: f.end, kind: 'cleanup',
+      frameLine: f.line, depth: f.depth, regContext: f.regContext
+    }];
+    ns.pc = f.pc + 1;
+    enqueue(s, key, ns, { kind: 'cleanup-run', line: f.line, depth: f.depth });
+  }
+
+  // 仅保留截断前已闭合节点构成的子 DAG，做路径多重度计数
+  const closedKeys = new Set();
+  for (const [k, node] of nodes) if (node.closed) closedKeys.add(k);
+  const out = new Map();
+  const indeg = new Map();
+  for (const k of closedKeys) { out.set(k, []); indeg.set(k, 0); }
+  for (const [a, b] of edges) {
+    if (closedKeys.has(a) && closedKeys.has(b)) {
+      out.get(a).push(b);
+      indeg.set(b, indeg.get(b) + 1);
+    }
+  }
+  const count = new Map();
+  const queue = [];
+  for (const [k, d] of indeg) if (d === 0) { count.set(k, 0); queue.push(k); }
+  count.set(initialKey, (count.get(initialKey) || 0) + 1);
+  let qi = 0;
+  let counted = 0;
+  while (qi < queue.length) {
+    const k = queue[qi++];
+    const c = count.get(k) || 0;
+    counted += 1;
+    for (const t of out.get(k)) {
+      count.set(t, (count.get(t) || 0) + c);
+      indeg.set(t, indeg.get(t) - 1);
+      if (indeg.get(t) === 0) queue.push(t);
+    }
+  }
+  if (counted !== closedKeys.size) {
+    // 防御性：结构化语言的有界展开不应产生环
+    return fatal('ledger-cycle', '生命周期账本遍历出现非预期环，无法完成路径计数');
+  }
+
+  // 汇总生命周期事件点（按源指令顺序，轮次/清理登记上下文分列）
+  const eventMap = new Map();
+  for (const [k, node] of nodes) {
+    if (!node.closed || !node.event) continue;
+    const ev = node.event;
+    const ek = ev.index + '|' + contextKey(ev.context);
+    let rec = eventMap.get(ek);
+    if (!rec) {
+      rec = {
+        index: ev.index, line: ev.line, kind: ev.kind,
+        cleanupBlocks: ev.cleanupBlocks, context: ev.context, paths: 0
+      };
+      eventMap.set(ek, rec);
+    }
+    rec.paths += count.get(k) || 0;
+  }
+  const points = [...eventMap.values()].sort((a, b) => {
+    if (a.index !== b.index) return a.index - b.index;
+    return contextKey(a.context).localeCompare(contextKey(b.context));
+  }).map((p) => ({
+    kind: p.kind, line: p.line,
+    cleanupBlocks: p.cleanupBlocks, context: p.context, paths: p.paths
+  }));
+
+  // 汇总各出口的令牌结局
+  const exitMap = new Map();
+  let pathsToViolation = 0;
+  for (const [k, node] of nodes) {
+    if (!node.closed) continue;
+    const c = count.get(k) || 0;
+    // 首条违规态被分层 FIFO 弹出并截断时已在闭合子图内：其多重度即到达首条违规的路径数
+    if (node.violation) pathsToViolation += c;
+    if (node.exit) {
+      const id = `${node.exit.kind}@${node.exit.line == null ? 'end' : node.exit.line}`;
+      let rec = exitMap.get(id);
+      if (!rec) {
+        rec = { kind: node.exit.kind, line: node.exit.line, released: 0, neverHeld: 0, stillHeld: 0 };
+        exitMap.set(id, rec);
+      }
+      if (node.exit.heldT) rec.stillHeld += c;
+      else if (node.exit.everT) rec.released += c;
+      else rec.neverHeld += c;
+    }
+  }
+  const exits = [...exitMap.values()].sort((a, b) => {
+    if (a.line == null && b.line != null) return 1;
+    if (b.line == null && a.line != null) return -1;
+    return (a.line || 0) - (b.line || 0) || a.kind.localeCompare(b.kind);
+  }).map((e) => {
+    const total = e.released + e.neverHeld + e.stillHeld;
+    return { ...e, totalPaths: total, conclusion: exitConclusion(e) };
+  });
+
+  const pathsToExits = exits.reduce((n, e) => n + e.totalPaths, 0);
+  const truncated = !base.ok && !base.fatal;
+  let cutoffReport = null;
+  if (truncated) {
+    const v = base.violation || (cutoff && cutoff.violation) || null;
+    cutoffReport = {
+      reason: 'first-violation',
+      violation: v ? {
+        type: v.type, line: v.line == null ? null : v.line,
+        token: v.token || null, detail: v.detail
+      } : null,
+      instructionSteps: base.counterexample ? base.counterexample.instructionSteps : null,
+      note: '脚本存在违规：穷尽搜索按最短指令步数、同长度保持源序（TRUE 先于 FALSE、循环次数升序）在首条违规处停止；' +
+        '账本仅覆盖该违规之前已执行的生命周期事件与此前已形成的出口，不含违规之后及未探索的控制路径。'
+    };
+  }
+
+  return {
+    ok: true,
+    fatal: false,
+    ledger: true,
+    token: T,
+    safe: base.ok,
+    truncated,
+    cutoff: cutoffReport,
+    stats: {
+      canonicalStates: base.stats.canonicalStates,
+      refinedStates: closedKeys.size,
+      instructions: I.length,
+      tokens: tokenNames.length,
+      pathsToExits,
+      pathsToViolation
+    },
+    points,
+    exits
+  };
+}
+
+function exitConclusion(e) {
+  const parts = [];
+  if (e.stillHeld > 0) {
+    parts.push({ code: 'still-held', label: '仍被持有', paths: e.stillHeld });
+  }
+  if (e.released > 0) parts.push({ code: 'released', label: '已释放', paths: e.released });
+  if (e.neverHeld > 0) parts.push({ code: 'never-held', label: '未曾持有', paths: e.neverHeld });
+  let code;
+  if (e.stillHeld > 0) code = 'still-held';
+  else if (e.released > 0 && e.neverHeld > 0) code = 'released-or-never';
+  else if (e.released > 0) code = 'released';
+  else code = 'never-held';
+  const text = parts.map((p) => `${p.paths} 条路径${p.label}`).join('，');
+  return { code, text };
+}
+
 module.exports = {
   verify,
   parse,
+  buildLedger,
   ParseError,
   MAX_TOKENS,
   MAX_INSTRUCTIONS,

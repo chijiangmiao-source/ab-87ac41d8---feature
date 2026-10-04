@@ -3,7 +3,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { verify, MAX_TOKENS, MAX_INSTRUCTIONS } = require('./verifier');
+const { verify, buildLedger, MAX_TOKENS, MAX_INSTRUCTIONS } = require('./verifier');
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -97,6 +97,27 @@ function createServer() {
         maxLoop: payload.maxLoop == null ? undefined : Number(payload.maxLoop)
       });
       // 任何错误/违规都意味着旧证据失效（evidenceRemoved 已由引擎置位）
+      sendJson(res, result.fatal ? 422 : 200, result);
+      return;
+    }
+
+    // 单令牌生命周期账本：仅对“当前已完成复核”的脚本与令牌表有意义（无会话状态，
+    // 由客户端在既有复核结论未失效时携带同一份草稿请求；结果页负责失效判定）
+    if (req.method === 'POST' && p === '/api/ledger') {
+      let payload;
+      try {
+        const text = await readBody(req);
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        sendJson(res, 400, { ok: false, fatal: true, evidenceRemoved: true,
+          error: { type: 'bad-request', message: '请求体不是合法 JSON' } });
+        return;
+      }
+      const result = buildLedger(payload.script == null ? '' : String(payload.script), {
+        tokenNames: Array.isArray(payload.tokens) ? payload.tokens : [],
+        maxLoop: payload.maxLoop == null ? undefined : Number(payload.maxLoop),
+        token: payload.token == null ? '' : String(payload.token)
+      });
       sendJson(res, result.fatal ? 422 : 200, result);
       return;
     }

@@ -30,7 +30,10 @@ function build() {
     ['离线穷尽复核台', html.includes('离线穷尽复核台')],
     ['提交复核按钮', html.includes('btnVerify')],
     ['清空草稿与结论', html.includes('清空草稿与结论')],
-    ['复核 API 调用', html.includes('/api/verify')]
+    ['复核 API 调用', html.includes('/api/verify')],
+    ['令牌生命周期账本入口', html.includes('btnLedger') && html.includes('ledgerToken')],
+    ['账本 API 调用', html.includes('/api/ledger')],
+    ['账本失效保护', html.includes('旧账本与结论快照已失效')]
   ];
   const failed = checks.filter(([, ok]) => !ok);
   if (failed.length) throw new Error('构建失败：页面缺少关键要素: ' + failed.map(([n]) => n).join(', '));
